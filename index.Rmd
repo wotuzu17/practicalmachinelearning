@@ -1,0 +1,181 @@
+---
+title: "Coursera Practical Machine Learning Course - CourseProject"
+author: "Andreas Voellenklee"
+date: "December 24, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(plyr)
+library(randomForest)
+library(MASS)
+library(e1071)    # for support vector machine
+library(gbm)      # for gbm
+library(survival) # for gbm
+library(foreach)  # required by doMC
+library(iterators)# required by doMC
+library(parallel) # required by doMC
+library(doMC)     # Parallel Processing for caret (doc: http://topepo.github.io/caret/parallel-processing.html)
+                  # does not work for R on windows
+```
+
+## Overview
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, we will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: [http://groupware.les.inf.puc-rio.br/har] (see the section on the Weight Lifting Exercise Dataset).
+
+## Data
+Source:
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. *Qualitative Activity Recognition of Weight Lifting Exercises.* Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. [pdf](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf)
+
+Training data for the project have been donwloaded from here:
+
+[https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv]
+
+20 test cases have been downloaded from here:
+
+[https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv]
+
+The test cases don't contain the outcome variable. They will be predicted by prediction models in this analysis.
+
+
+### Reading Raw Data into R
+The csv files are located in the Download folder in the home directory.
+```{r}
+dataset.raw <- read.csv("~/Downloads/pml-training.csv", na.strings=c("NA", ""))
+testcases.raw <- read.csv("~/Downloads/pml-testing.csv", na.strings=c("NA", ""))
+```
+
+### Filtering Data
+The training data contains `r nrow(dataset.raw)` observations with `r ncol(dataset.raw)` columns. The column `classe` contains the outcome variable-the way the participant performed the exercise. It is a factor of the following levels:
+
+* Class A: exactly according to the specification
+* Class B: throwing the elbows to the front
+* Class C: lifting the dumbbell only halfway
+* Class D: lowering the dumbbell only halfway
+* Class E: throwing the hips to the front
+
+Columns not suitable for machine learning training are removed from both datasets:
+```{r}
+colsToRemove <- c(1, # auto increment index
+                  3,4,5, # timestamps
+                  6, # new_window
+                  7, # number of window (autoincrement)
+  as.vector(which(colSums(is.na(dataset.raw)) > 0)) # columns that contain missing data (NA)
+)
+dataset <- dataset.raw[,-colsToRemove]
+testcases <- testcases.raw[,-colsToRemove]
+```
+
+After filtering, `r ncol(dataset)-1` columns containing the name of the partizipants and measurements from the on-body-sensors remain.
+
+### Data Splitting into train and test data
+In order to measure the performance of a trained model on out-of-sample test data, the dataset is split into training and testing data. The train dataset contains 3/4 of all observations of all classes. In order to provide exact reproducibility, a seed for the random number generator is set.
+
+```{r}
+set.seed(123)
+inTrain <- createDataPartition(dataset$classe, p=3/4)[[1]]
+train <- dataset[inTrain, ]
+test <- dataset[-inTrain, ]
+```
+
+## Training and Prediction
+### Setup caret for multi-core-processing
+The caret package is able to use multi-core-processing. This is documented in the [caret package manual](http://topepo.github.io/caret/parallel-processing.html). Some functions are not available for Windows OS. A alternative approach to multi-core-processing is documented [here](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md). 
+```{r}
+registerDoMC(cores=detectCores()-1) # leave one core for the OS
+## All subsequent caret train models are then run in parallel
+```
+On my Lenovo ThinkPad T430s, 3 out of 4 available cores are registered to Multi-Core-Processing. The computer is euipped with a Intel® Core™ i7-3520M CPU and 16GB of RAM. It has the Ubuntu 14.04 operating system.
+
+### Random Forest
+The fit control is set to 3 fold cross validation. The train process uses accuracy to select the optimal model using the largest value.
+
+```{r, cache=TRUE}
+fitControl <- trainControl(method = "cv", number = 3, allowParallel = TRUE)
+start.time <- Sys.time()
+rfFit <- train(classe ~ ., data=train, method="rf", trControl=fitControl)
+time.rfFit <- Sys.time() - start.time
+#### apply random forest model to test data
+rfPred <- predict(rfFit, test)
+rfCM <- confusionMatrix(rfPred, test$classe)
+rfCM
+```
+
+It turns out that this model provides excellent prediction capabilities on the test set (accuracy: `r rfCM$overall[[1]]`). In order to compare the performance of the random tree model with other models with respect to training time and accuracy, another 3 different algorithms are tried out.
+
+### Linear Discriminant Analysis
+The linear discriminant analysis is computational efficient algorithm, thus trains fast. There is no tuning parameter for this model.
+
+```{r, cache=TRUE}
+start.time <- Sys.time()
+ldaFit <- train(classe ~ ., data=train, method="lda")
+time.ldaFit <- Sys.time() - start.time
+#### apply lda model to test data
+ldaPred <- predict(ldaFit, test)
+ldaCM <- confusionMatrix(ldaPred, test$classe)
+ldaCM
+```
+
+The model achieves a accuracy of `r ldaCM$overall[[1]]` on the test set, which is much less than the random forest model.
+
+### Stochastic Gradient Boosting (gbm)
+The gbm method is used for training on the default parameters. That includes no pre-processing and bootstrapping for resampling (25 reps).
+
+```{r, cache=TRUE}
+start.time <- Sys.time()
+gbmFit <- train(classe ~ ., data=train, method="gbm")
+time.gbmFit <- Sys.time()- start.time
+#### apply random forest model to test data
+gbmPred <- predict(gbmFit, test)
+gbmCM <- confusionMatrix(gbmPred, test$classe)
+gbmCM
+```
+
+It turns out that this model provides a good accuracy of about `r gbmCM$overall[[1]]` on the test set.
+
+### Support Vector Machine
+In order to fit the model, we are using the svm function from the *e1071* package. This function does not support multi-core-processing. We are using the svm function on its standard parameters.
+
+```{r, cache=TRUE}
+start.time <- Sys.time()
+svmFit <- svm(classe ~ ., data=train)
+time.svmFit <- Sys.time()- start.time
+#### apply support vector machine model to test data
+svmPred <- predict(svmFit, test)
+svmCM <- confusionMatrix(svmPred, test$classe)
+svmCM
+```
+
+The achieved accuracy on the test set is `r svmCM$overall[[1]]`.
+
+### Predicting the 20 test cases
+```{r}
+result <- data.frame("id" = testcases$problem_id, 
+                     "rf"  = predict(rfFit, testcases),
+                     "lda" = predict(ldaFit, testcases),
+                     "gbm" = predict(gbmFit, testcases),
+                     "svm" = predict(svmFit, testcases)
+                     )
+print(result, row.names=FALSE)
+```
+It turns out that with the exception of the *lda* predictor, all models agree on the outcome for the 20 test cases.
+
+## Model comparison
+
+```{r}
+modelDF <- data.frame(
+  "model" = c("rf", "lda", "gbm", "svm"),
+  "accuracy" = round(c(rfCM$overall[[1]], 
+                       ldaCM$overall[[1]],
+                       gbmCM$overall[[1]], 
+                       svmCM$overall[[1]]), 3),
+  "traintime/min" = round(c(as.numeric(time.rfFit, units="mins"),
+                            as.numeric(time.ldaFit, units="mins"),
+                            as.numeric(time.gbmFit, units="mins"),
+                            as.numeric(time.svmFit, untis="mins")),3))
+modelDF
+```
+
+Note that the svm model was trained only on a single core.
